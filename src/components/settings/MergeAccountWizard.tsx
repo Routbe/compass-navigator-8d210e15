@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { useI18n } from "@/lib/i18n";
 import { previewAccountMerge, redeemAccountMerge, startAccountMerge } from "@/lib/account-merge.functions";
 import { cn } from "@/lib/utils";
+import { withStepUp } from "@/components/auth/StepUpDialog";
 
 type Role = "primary" | "secondary";
 type Side = "primary" | "secondary";
@@ -99,7 +100,7 @@ export function MergeAccountWizard() {
   const generate = async () => {
     setBusy(true);
     try {
-      const r = await startAccountMerge();
+      const r = await withStepUp(() => startAccountMerge());
       setTicket({ pin: r.pin, qrPayload: r.qrPayload });
     } catch {
       toast.error(t("merge_account.error"));
@@ -127,7 +128,7 @@ export function MergeAccountWizard() {
     if (!window.confirm("Samenvoegen kan niet ongedaan gemaakt worden. Doorgaan?")) return;
     setBusy(true);
     try {
-      const r = await redeemAccountMerge({ data: { ...codeInput(), code, keepHandle, keepDesign } });
+      const r = await withStepUp(() => redeemAccountMerge({ data: { ...codeInput(), code, keepHandle, keepDesign } }));
       if (!r.ok) return toast.error(ERRORS[r.reason ?? ""] ?? "Deze code is ongeldig of verlopen. Begin opnieuw.");
       toast.success(t("merge_account.success"));
       window.location.href = "/auth/sign-in";
