@@ -17,6 +17,8 @@ import {
   decideAuthorizeRequest,
   sendStepUpCode,
   verifyStepUp,
+  startPasskeyStepUpFn,
+  finishPasskeyStepUpFn,
   silentAuthorize,
   type AuthorizePrompt,
 } from "@/lib/oauth/console.functions";
@@ -144,6 +146,35 @@ function AuthorizePage() {
     loginHint: search.login_hint ?? null,
   };
 
+  // The authorization request a step-up proof is bound to (server re-derives the id).
+  const binding = {
+    clientId: payload.clientId,
+    redirectUri: payload.redirectUri,
+    state: payload.state,
+    nonce: payload.nonce,
+    codeChallenge: payload.codeChallenge,
+  };
+  const startPasskey = useServerFn(startPasskeyStepUpFn);
+  const finishPasskey = useServerFn(finishPasskeyStepUpFn);
+
+  async function confirmPasskey() {
+    setBusy(true);
+    setCodeError(null);
+    try {
+      const start = await startPasskey({ data: binding });
+      if (!start.ok) return setCodeError(start.error);
+      const { startAuthentication } = await import("@simplewebauthn/browser");
+      const assertion = await startAuthentication({ optionsJSON: start.options as never });
+      const r = await finishPasskey({ data: { ...binding, assertion: assertion as never } });
+      if (r.ok) setStepUpDone(true);
+      else setCodeError(r.error);
+    } catch {
+      setCodeError(t("auth.consent.verifyFailed"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   // Niet ingelogd? Eerst aanmelden, daarna terug naar exact dit scherm.
   // prompt=none: never show a screen — redirect back with a code or an OIDC error.
   useEffect(() => {
@@ -187,7 +218,7 @@ function AuthorizePage() {
     setBusy(true);
     setCodeError(null);
     try {
-      const r = await sendCode({ data: { clientId: payload.clientId } });
+      const r = await sendCode({ data: binding });
       if (r.ok) setCodeSentTo(r.sentTo ?? t("auth.consent.email"));
       else setCodeError(r.error ?? t("auth.consent.sendFailed"));
     } catch {
@@ -205,7 +236,7 @@ function AuthorizePage() {
     setBusy(true);
     setCodeError(null);
     try {
-      const r = await verifyCode({ data: { clientId: payload.clientId, code } });
+      const r = await verifyCode({ data: { ...binding, code } });
       if (r.ok) setStepUpDone(true);
       else setCodeError(r.error);
     } catch {
@@ -482,9 +513,14 @@ function AuthorizePage() {
                 </button>
               </div>
             ) : (
-              <Button variant="outline" className="mt-3 w-full" onClick={requestCode} disabled={busy}>
-                <Mail className="h-4 w-4" aria-hidden /> {t("auth.code.send")}
-              </Button>
+              <div className="mt-3 space-y-2">
+                <Button className="w-full" onClick={confirmPasskey} disabled={busy}>
+                  <KeyRound className="h-4 w-4" aria-hidden /> {t("auth.consent.passkey", { defaultValue: "Bevestig met passkey" })}
+                </Button>
+                <Button variant="outline" className="w-full" onClick={requestCode} disabled={busy}>
+                  <Mail className="h-4 w-4" aria-hidden /> {t("auth.code.send")}
+                </Button>
+              </div>
             )}
             {codeError && <p className="mt-2 text-xs text-destructive">{codeError}</p>}
           </div>

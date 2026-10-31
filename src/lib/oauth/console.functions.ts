@@ -609,7 +609,7 @@ const stepUpBindingSchema = z.object({
 
 /** Server-derived id of the authorization request a step-up proof is bound to. */
 async function stepUpRequest(data: z.infer<typeof stepUpBindingSchema>) {
-  const { getClientByClientId } = await import("./provider.server");
+  const { getClientByClientId, redirectAllowed } = await import("./provider.server");
   const client = await getClientByClientId(data.clientId);
   if (!client || client.status !== "active" || !redirectAllowed(client, data.redirectUri)) return null;
   const { authorizationRequestId } = await import("./step-up-binding");
