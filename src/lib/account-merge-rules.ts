@@ -47,6 +47,7 @@ export const MERGE_TABLES: Readonly<Record<string, MergeTableRule>> = {
   security_codes: r("drop"),
   oauth_auth_codes: r("drop"),
   oauth_step_up_codes: r("drop"),
+  oauth_step_up_challenges: r("drop"),
   oauth_access_tokens: r("drop"),
   oauth_refresh_tokens: r("drop"),
   phone_otp_codes: r("drop"),

@@ -160,7 +160,7 @@ async function authStatements(primaryId: string, secondaryId: string): Promise<S
     },
     { query: `delete ${collide("$1", "$2")}`, params: [sBa, pBa] },
     { query: `update neon_auth.account set "userId" = $1::uuid, "updatedAt" = now() where "userId"::text = $2`, params: [pBa, sBa] },
-    { query: `update neon_auth.passkey set "userId" = $1::uuid where "userId"::text = $2`, params: [pBa, sBa] },
+    { query: `update neon_auth.passkey set "userId" = $1 where "userId"::text = $2`, params: [pBa, sBa] },
     { query: `delete from neon_auth."twoFactor" where "userId"::text = $1`, params: [sBa] },
     { query: `delete from neon_auth.session where "userId"::text = $1`, params: [sBa] },
     { query: `delete from neon_auth."user" where id::text = $1`, params: [sBa] },
