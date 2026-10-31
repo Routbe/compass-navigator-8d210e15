@@ -156,10 +156,7 @@ export function tableStatements(table: string, rule: MergeTableRule, primaryId: 
     case "skip":
       return [assertStatement(`not exists (select 1 from ${t} where ${c} = $2)`, `merge_blocked:${table}`, p)];
     case "drop":
-      return [{ query: `delete from ${t} where ${c} = $2`, params: [secondaryId] }].map((s) => ({
-        query: s.query.replace("$2", "$1"),
-        params: s.params,
-      }));
+      return [{ query: `delete from ${t} where ${c} = $1`, params: [secondaryId] }];
     case "reassign":
       return [{ query: `update ${t} set ${c} = $1 where ${c} = $2`, params: p }];
     case "dedupe_keep_primary": {
