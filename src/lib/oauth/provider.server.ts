@@ -836,50 +836,177 @@ export async function hasConsent(
 
 /* -------------------------------------------------------------- step-up */
 
-export async function createStepUpCode(userId: string, clientId: string): Promise<string> {
+async function otpKey(): Promise<CryptoKey> {
+  const { resolveAuthSecret } = await import("@/lib/better-auth.server");
+  const s = resolveAuthSecret();
+  if (!s?.secret) throw new Error("step_up_secret_missing");
+  const { deriveOtpKey } = await import("./step-up-binding");
+  return deriveOtpKey(s.secret);
+}
+
+/** New e-mail OTP for one authorization request; older open codes for it are closed. */
+export async function createStepUpCode(userId: string, clientId: string, requestId: string): Promise<string> {
+  const { otpHash, STEP_UP_TTL_SEC } = await import("./step-up-binding");
   const digits = crypto.getRandomValues(new Uint32Array(1))[0]! % 1_000_000;
   const code = String(digits).padStart(6, "0");
-  const hash = await sha256Base64Url(`${userId}:${clientId}:${code}`);
-  const expires = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-  await sql`update public.oauth_step_up_codes set consumed_at = now()
-    where user_id = ${userId} and client_id = ${clientId} and consumed_at is null`;
-  await sql`insert into public.oauth_step_up_codes (user_id, client_id, code_hash, expires_at)
-    values (${userId}, ${clientId}, ${hash}, ${expires})`;
+  const hash = await otpHash(await otpKey(), userId, clientId, requestId, code);
+  await sql.transaction([
+    sql`update public.oauth_step_up_codes set consumed_at = now()
+      where user_id = ${userId} and client_id = ${clientId} and consumed_at is null and verified_at is null`,
+    sql`insert into public.oauth_step_up_codes (user_id, client_id, request_id, method, code_hash, expires_at)
+      values (${userId}, ${clientId}, ${requestId}, 'email', ${hash}, now() + make_interval(secs => ${STEP_UP_TTL_SEC}))`,
+  ]);
   return code;
 }
 
-/** Controleert de code (max. 5 pogingen, 10 min geldig) en markeert hem als geverifieerd. */
-export async function verifyStepUpCode(userId: string, clientId: string, code: string) {
-  const rows = (await sql`select id, code_hash, attempts, expires_at from public.oauth_step_up_codes
-    where user_id = ${userId} and client_id = ${clientId} and consumed_at is null and verified_at is null
-    order by created_at desc limit 1`) as Row[];
-  const row = rows[0];
-  const { stepUpCodeState } = await import("./step-up");
-  const hash = await sha256Base64Url(`${userId}:${clientId}:${code.trim()}`);
-  const state = stepUpCodeState(
-    row ? { attempts: Number(row["attempts"]), expiresAt: String(row["expires_at"]), matches: hash === row["code_hash"] } : null,
+/**
+ * Checks the code in ONE conditional UPDATE (attempts < limit, not verified,
+ * not expired): parallel guesses cannot exceed the attempt limit.
+ */
+export async function verifyStepUpCode(userId: string, clientId: string, requestId: string, code: string) {
+  const { otpHash, classifyVerify } = await import("./step-up-binding");
+  const { STEP_UP_MAX_ATTEMPTS } = await import("./step-up");
+  const hash = await otpHash(await otpKey(), userId, clientId, requestId, code);
+  const rows = (await sql`
+    with c as (
+      select id, attempts, expires_at from public.oauth_step_up_codes
+       where user_id = ${userId} and client_id = ${clientId} and request_id = ${requestId}
+         and method = 'email' and consumed_at is null and verified_at is null
+       order by created_at desc limit 1),
+    u as (
+      update public.oauth_step_up_codes t
+         set verified_at = case when t.code_hash = ${hash} then now() else null end,
+             attempts = t.attempts + case when t.code_hash = ${hash} then 0 else 1 end
+        from c
+       where t.id = c.id and t.attempts < ${STEP_UP_MAX_ATTEMPTS} and t.expires_at > now() and t.verified_at is null
+      returning (t.verified_at is not null) as ok)
+    select (select ok from u) as ok, (select count(*) from u)::int as updated,
+           (select attempts from c) as attempts, (select expires_at from c) as expires_at`) as Row[];
+  const r = rows[0] ?? {};
+  return classifyVerify(
+    Number(r["updated"] ?? 0) > 0 ? { ok: Boolean(r["ok"]) } : null,
+    r["expires_at"] ? { attempts: Number(r["attempts"] ?? 0), expiresAt: new Date(String(r["expires_at"])).toISOString() } : null,
     Date.now(),
   );
-  if (!row) return state;
-  if (state === "ok") {
-    await sql`update public.oauth_step_up_codes set verified_at = now() where id = ${row["id"] as string}`;
-  } else if (state === "wrong") {
-    await sql`update public.oauth_step_up_codes set attempts = attempts + 1 where id = ${row["id"] as string}`;
-  }
-  return state;
 }
 
-/** Verbruikt een recent geverifieerde code (eenmalig, binnen 10 minuten). */
-export async function consumeVerifiedStepUp(userId: string, clientId: string): Promise<boolean> {
+/** Consumes the verified proof of exactly this request + client, once, within 5 minutes. */
+export async function consumeVerifiedStepUp(userId: string, clientId: string, requestId: string): Promise<boolean> {
+  const { STEP_UP_TTL_SEC } = await import("./step-up-binding");
   const rows = (await sql`update public.oauth_step_up_codes set consumed_at = now()
     where id = (select id from public.oauth_step_up_codes
-                 where user_id = ${userId} and client_id = ${clientId}
+                 where user_id = ${userId} and client_id = ${clientId} and request_id = ${requestId}
                    and verified_at is not null and consumed_at is null
-                   and verified_at > now() - interval '10 minutes'
+                   and verified_at > now() - make_interval(secs => ${STEP_UP_TTL_SEC})
                  order by verified_at desc limit 1)
     and consumed_at is null
     returning id`) as Row[];
   return rows.length > 0;
+}
+
+/* ------------------------------------------------- passkey step-up (WebAuthn) */
+
+function passkeyRp(): { rpID: string; origin: string } {
+  const origin = new URL(canonicalAppUrl()).origin;
+  return { rpID: new URL(origin).hostname, origin };
+}
+
+async function betterAuthUserId(userId: string): Promise<string | null> {
+  const rows = (await sql`select coalesce(auth_user_id::text, user_metadata->>'neon_auth_id') as ba
+    from public.users where id = ${userId} limit 1`) as Row[];
+  return (rows[0]?.["ba"] as string | null) ?? null;
+}
+
+/** Single-use challenge for this authorization request; returns WebAuthn request options. */
+export async function startPasskeyStepUp(userId: string, clientId: string, requestId: string) {
+  const ba = await betterAuthUserId(userId);
+  if (!ba) return null;
+  const keys = (await sql`select "credentialID" as id, transports from neon_auth.passkey where "userId" = ${ba}`) as Row[];
+  if (!keys.length) return null;
+  const { generateAuthenticationOptions } = await import("@simplewebauthn/server");
+  const { STEP_UP_TTL_SEC } = await import("./step-up-binding");
+  const { rpID } = passkeyRp();
+  const options = await generateAuthenticationOptions({
+    rpID,
+    userVerification: "required",
+    timeout: STEP_UP_TTL_SEC * 1000,
+    allowCredentials: keys.map((k) => ({
+      id: String(k["id"]),
+      transports: k["transports"] ? (String(k["transports"]).split(",") as never) : undefined,
+    })),
+  });
+  await sql.transaction([
+    sql`update public.oauth_step_up_challenges set consumed_at = now()
+      where user_id = ${userId} and client_id = ${clientId} and consumed_at is null`,
+    sql`insert into public.oauth_step_up_challenges (user_id, client_id, request_id, challenge, expires_at)
+      values (${userId}, ${clientId}, ${requestId}, ${options.challenge}, now() + make_interval(secs => ${STEP_UP_TTL_SEC}))`,
+  ]);
+  return options;
+}
+
+export type PasskeyStepUpResult = "ok" | "expired" | "origin" | "challenge" | "unknown_key" | "invalid" | "counter";
+
+/**
+ * Verifies a WebAuthn assertion for this request: challenge (single use, bound
+ * to user + client + request), origin, RP ID, user presence + verification,
+ * signature and counter. Success records a verified, request-bound proof.
+ */
+export async function finishPasskeyStepUp(
+  userId: string,
+  clientId: string,
+  requestId: string,
+  response: { id: string; rawId: string; type: string; response: { clientDataJSON: string; authenticatorData: string; signature: string; userHandle?: string }; clientExtensionResults?: Record<string, unknown> },
+): Promise<PasskeyStepUpResult> {
+  const { checkClientData, counterAccepted } = await import("./step-up-binding");
+  // Claim the challenge first, atomically: a replay finds nothing to claim.
+  const claimed = (await sql`update public.oauth_step_up_challenges set consumed_at = now()
+    where id = (select id from public.oauth_step_up_challenges
+                 where user_id = ${userId} and client_id = ${clientId} and request_id = ${requestId}
+                   and consumed_at is null and expires_at > now()
+                 order by created_at desc limit 1)
+      and consumed_at is null
+    returning challenge`) as Row[];
+  const challenge = claimed[0]?.["challenge"] as string | undefined;
+  if (!challenge) return "expired";
+  const { rpID, origin } = passkeyRp();
+  const pre = checkClientData(response.response.clientDataJSON, { challenge, origin });
+  if (!pre.ok) return pre.reason === "origin" ? "origin" : "challenge";
+  const ba = await betterAuthUserId(userId);
+  const keys = ba
+    ? ((await sql`select id, "publicKey" as pk, counter, transports from neon_auth.passkey
+        where "userId" = ${ba} and "credentialID" = ${response.id} limit 1`) as Row[])
+    : [];
+  const key = keys[0];
+  if (!key) return "unknown_key";
+  const { verifyAuthenticationResponse } = await import("@simplewebauthn/server");
+  let verification: Awaited<ReturnType<typeof verifyAuthenticationResponse>>;
+  try {
+    verification = await verifyAuthenticationResponse({
+      response: response as never,
+      expectedChallenge: challenge,
+      expectedOrigin: origin,
+      expectedRPID: rpID,
+      requireUserVerification: true,
+      credential: {
+        id: response.id,
+        publicKey: Uint8Array.from(atob(String(key["pk"])), (c) => c.charCodeAt(0)),
+        counter: Number(key["counter"] ?? 0),
+      },
+    });
+  } catch (error) {
+    console.warn("[oauth] passkey step-up rejected", (error as Error)?.message);
+    return "invalid";
+  }
+  if (!verification.verified) return "invalid";
+  const next = verification.authenticationInfo.newCounter;
+  if (!counterAccepted(Number(key["counter"] ?? 0), next)) return "counter";
+  const { STEP_UP_TTL_SEC } = await import("./step-up-binding");
+  await sql.transaction([
+    sql`update neon_auth.passkey set counter = ${next} where id = ${key["id"] as string}`,
+    sql`insert into public.oauth_step_up_codes (user_id, client_id, request_id, method, code_hash, expires_at, verified_at)
+      values (${userId}, ${clientId}, ${requestId}, 'passkey', 'passkey', now() + make_interval(secs => ${STEP_UP_TTL_SEC}), now())`,
+  ]);
+  return "ok";
 }
 
 export async function subjectFor(client: OAuthClient, userId: string, redirectUri: string): Promise<string> {

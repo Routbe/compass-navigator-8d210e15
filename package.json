@@ -67,6 +67,7 @@
     "@resvg/resvg-wasm": "^2.6.2",
     "@rive-app/react-webgl2": "^4.28.6",
     "@simplewebauthn/browser": "13",
+    "@simplewebauthn/server": "13",
     "@streamdown/cjk": "^1.0.3",
     "@streamdown/code": "^1.1.1",
     "@streamdown/math": "^1.0.2",

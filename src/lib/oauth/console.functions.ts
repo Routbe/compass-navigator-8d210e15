@@ -506,7 +506,9 @@ export const decideAuthorizeRequest = createServerFn({ method: "POST" })
         }),
       };
     }
-    if (stepUp && !(await consumeVerifiedStepUp(context.userId, client.clientId))) {
+    const { authorizationRequestId } = await import("./step-up-binding");
+    const requestId = await authorizationRequestId(data);
+    if (stepUp && !(await consumeVerifiedStepUp(context.userId, client.clientId, requestId))) {
       return { error: "Bevestig eerst de verificatiecode." };
     }
 
@@ -597,14 +599,35 @@ export const silentAuthorize = createServerFn({ method: "POST" })
 
 /* ------------------------------------------------------------ step-up ---- */
 
+const stepUpBindingSchema = z.object({
+  clientId: z.string().min(4).max(120),
+  redirectUri: z.string().min(4).max(2000).transform((v) => cleanRedirectUri(v)),
+  state: z.string().max(300).nullable().optional(),
+  nonce: z.string().max(300).nullable().optional(),
+  codeChallenge: z.string().max(200),
+});
+
+/** Server-derived id of the authorization request a step-up proof is bound to. */
+async function stepUpRequest(data: z.infer<typeof stepUpBindingSchema>) {
+  const { getClientByClientId, redirectAllowed } = await import("./provider.server");
+  const client = await getClientByClientId(data.clientId);
+  if (!client || client.status !== "active" || !redirectAllowed(client, data.redirectUri)) return null;
+  const { authorizationRequestId } = await import("./step-up-binding");
+  return { client, requestId: await authorizationRequestId(data) };
+}
+
 export const sendStepUpCode = createServerFn({ method: "POST" })
   .middleware([requireAuth])
-  .inputValidator((data: unknown) => z.object({ clientId: z.string().min(4).max(120) }).parse(data))
+  .inputValidator((data: unknown) => stepUpBindingSchema.parse(data))
   .handler(async ({ data, context }) => {
-    const { getClientByClientId, createStepUpCode } = await import("./provider.server");
-    const client = await getClientByClientId(data.clientId);
-    if (!client || client.status !== "active") return { ok: false, error: "Deze app is onbekend bij ROUT." };
-    const code = await createStepUpCode(context.userId, client.clientId);
+    const req = await stepUpRequest(data);
+    if (!req) return { ok: false, error: "Deze app is onbekend bij ROUT." };
+    const { hitRateLimit } = await import("@/lib/rate-limit-db.server");
+    const rl = await hitRateLimit("oauth-step-up-send", context.userId, { limit: 5, windowSec: 600 });
+    if (!rl.ok) return { ok: false, error: "Te veel aanvragen. Probeer het later opnieuw." };
+    const { client, requestId } = req;
+    const { createStepUpCode } = await import("./provider.server");
+    const code = await createStepUpCode(context.userId, client.clientId, requestId);
     const { sendTransactionalEmail } = await import("@/lib/notifications.server");
     const safeName = client.name.replace(/[<>&"]/g, "");
     const sent = await sendTransactionalEmail({
@@ -612,7 +635,7 @@ export const sendStepUpCode = createServerFn({ method: "POST" })
       subject: `Je ROUT-code: ${code}`,
       html: `<p>Je verificatiecode om door te gaan naar <strong>${safeName}</strong>:</p>
              <p style="font-size:28px;letter-spacing:6px;font-family:monospace"><strong>${code}</strong></p>
-             <p>Deze code is 10 minuten geldig. Vroeg je dit niet aan? Negeer dan deze e-mail.</p>`,
+             <p>Deze code is 5 minuten geldig. Vroeg je dit niet aan? Negeer dan deze e-mail.</p>`,
       tags: ["oauth-step-up"],
     });
     const [user, domain] = context.user.email.split("@");
@@ -622,12 +645,12 @@ export const sendStepUpCode = createServerFn({ method: "POST" })
 
 export const verifyStepUp = createServerFn({ method: "POST" })
   .middleware([requireAuth])
-  .inputValidator((data: unknown) =>
-    z.object({ clientId: z.string().min(4).max(120), code: z.string().regex(/^\d{6}$/) }).parse(data),
-  )
+  .inputValidator((data: unknown) => stepUpBindingSchema.extend({ code: z.string().regex(/^\d{6}$/) }).parse(data))
   .handler(async ({ data, context }) => {
+    const req = await stepUpRequest(data);
+    if (!req) return { ok: false, error: "Deze app is onbekend bij ROUT." };
     const { verifyStepUpCode } = await import("./provider.server");
-    const state = await verifyStepUpCode(context.userId, data.clientId, data.code);
+    const state = await verifyStepUpCode(context.userId, req.client.clientId, req.requestId, data.code);
     const messages: Record<string, string> = {
       ok: "",
       wrong: "Die code klopt niet.",
@@ -636,6 +659,53 @@ export const verifyStepUp = createServerFn({ method: "POST" })
       missing: "Vraag eerst een code aan.",
     };
     return { ok: state === "ok", error: messages[state] ?? "" };
+  });
+
+/** Passkey step-up, step 1: single-use challenge bound to this authorization request. */
+export const startPasskeyStepUpFn = createServerFn({ method: "POST" })
+  .middleware([requireAuth])
+  .inputValidator((data: unknown) => stepUpBindingSchema.parse(data))
+  .handler(async ({ data, context }) => {
+    const req = await stepUpRequest(data);
+    if (!req) return { ok: false as const, error: "Deze app is onbekend bij ROUT." };
+    const { startPasskeyStepUp } = await import("./provider.server");
+    const options = await startPasskeyStepUp(context.userId, req.client.clientId, req.requestId);
+    return options ? { ok: true as const, options: JSON.parse(JSON.stringify(options)) as Record<string, unknown> } : { ok: false as const, error: "Geen passkey gevonden voor dit account." };
+  });
+
+const assertionSchema = z.object({
+  id: z.string().max(1024),
+  rawId: z.string().max(1024),
+  type: z.literal("public-key"),
+  response: z.object({
+    clientDataJSON: z.string().max(4096),
+    authenticatorData: z.string().max(4096),
+    signature: z.string().max(4096),
+    userHandle: z.string().max(1024).optional(),
+  }),
+  clientExtensionResults: z.record(z.string(), z.unknown()).optional(),
+  authenticatorAttachment: z.string().max(40).optional(),
+});
+
+/** Passkey step-up, step 2: server-side WebAuthn verification. */
+export const finishPasskeyStepUpFn = createServerFn({ method: "POST" })
+  .middleware([requireAuth])
+  .inputValidator((data: unknown) => stepUpBindingSchema.extend({ assertion: assertionSchema }).parse(data))
+  .handler(async ({ data, context }) => {
+    const req = await stepUpRequest(data);
+    if (!req) return { ok: false, error: "Deze app is onbekend bij ROUT." };
+    const { finishPasskeyStepUp } = await import("./provider.server");
+    const result = await finishPasskeyStepUp(context.userId, req.client.clientId, req.requestId, data.assertion);
+    const messages: Record<string, string> = {
+      ok: "",
+      expired: "De passkey-aanvraag is verlopen. Probeer opnieuw.",
+      origin: "Deze passkey-bevestiging komt niet van ROUT.",
+      challenge: "Deze passkey-bevestiging hoort niet bij dit verzoek.",
+      unknown_key: "Deze passkey hoort niet bij je account.",
+      invalid: "De passkey kon niet worden geverifieerd.",
+      counter: "Deze passkey lijkt gekopieerd. Gebruik een andere methode.",
+    };
+    return { ok: result === "ok", error: messages[result] ?? "" };
   });
 
 /** Explicit owner action; never accepts an owner identity from the browser. */
