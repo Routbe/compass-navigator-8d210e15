@@ -149,16 +149,16 @@ async function authStatements(primaryId: string, secondaryId: string): Promise<S
       },
     ];
   }
-  const collide = `from neon_auth.account s where s."userId"::text = $2 and exists (
-      select 1 from neon_auth.account p where p."userId"::text = $3 and p."providerId" = s."providerId")`;
+  const collide = (sec: string, prim: string) => `from neon_auth.account s where s."userId"::text = ${sec} and exists (
+      select 1 from neon_auth.account p where p."userId"::text = ${prim} and p."providerId" = s."providerId")`;
   return [
     {
       query: `insert into public.merged_auth_account_archive
         (primary_user_id, secondary_auth_user_id, provider_id, provider_account_id, original_created_at)
-        select $1, $2, s."providerId", s."accountId", s."createdAt" ${collide}`,
+        select $1, $2, s."providerId", s."accountId", s."createdAt" ${collide("$2", "$3")}`,
       params: [primaryId, sBa, pBa],
     },
-    { query: `delete ${collide.replace("from neon_auth.account s", "from neon_auth.account s")}`.replace("delete from", "delete from"), params: [null, sBa, pBa] },
+    { query: `delete ${collide("$1", "$2")}`, params: [sBa, pBa] },
     { query: `update neon_auth.account set "userId" = $1::uuid, "updatedAt" = now() where "userId"::text = $2`, params: [pBa, sBa] },
     { query: `update neon_auth.passkey set "userId" = $1::uuid where "userId"::text = $2`, params: [pBa, sBa] },
     { query: `delete from neon_auth."twoFactor" where "userId"::text = $1`, params: [sBa] },
