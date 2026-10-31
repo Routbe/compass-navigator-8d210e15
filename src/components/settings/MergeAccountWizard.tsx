@@ -30,6 +30,8 @@ const ERRORS: Record<string, string> = {
   bad_code: "De code uit je e-mail klopt niet of is verlopen.",
   rate_limited: "Te veel aanvragen. Probeer het later opnieuw.",
   no_email: "Dit account heeft geen e-mailadres om de code naar te sturen.",
+  blocked: "Dit account heeft een identiteitsbewijs, wallet of betaalgegevens. Samenvoegen kan daarom niet automatisch.",
+  failed: "Samenvoegen is mislukt. Er is niets gewijzigd; probeer het opnieuw.",
 };
 
 function AccountCard({ s, label }: { s: Summary; label: string }) {
